@@ -57,6 +57,13 @@
   /** Skip writing the URL while applying restored filters. */
   var suppressUrlWrite = false;
 
+  /**
+   * Bumped at the start of Clear so in-flight Query sync/more callbacks
+   * cannot write the previous filter set back to the URL.
+   */
+  var persistGeneration = 0;
+  var clearInProgress = false;
+
   /** Keys already restored this modal open (inflate once per open). */
   var restoredThisOpen = Object.create(null);
 
@@ -875,6 +882,9 @@
         return readUrlPages();
       }
       if (fingerprint !== manageFingerprint) {
+        if (queryIsStale(query)) {
+          return 1;
+        }
         manageFingerprint = fingerprint;
         writeManageUrl(1, query.props);
         return 1;
@@ -916,8 +926,40 @@
     return clampPages(saved.pages);
   }
 
+  function getLiveLibraryProps() {
+    try {
+      var frame = null;
+      if (isManageContext() && window.wp && wp.media && wp.media.frames) {
+        frame = wp.media.frames.browse || null;
+      }
+      if (!frame && window.wp && wp.media && wp.media.frame) {
+        frame = wp.media.frame;
+      }
+      if (!frame || typeof frame.state !== 'function') {
+        return null;
+      }
+      var state = frame.state();
+      var library = state && typeof state.get === 'function' ? state.get('library') : null;
+      return library && library.props ? library.props : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function queryIsStale(query) {
+    if (query && query._mlsPersistGen != null && query._mlsPersistGen !== persistGeneration) {
+      return true;
+    }
+    var live = getLiveLibraryProps();
+    return !!(live && fingerprintQuery(query) !== fingerprintProps(live));
+  }
+
   function persistAfterLoad(query, pages) {
     pages = clampPages(pages);
+
+    if (queryIsStale(query)) {
+      return;
+    }
 
     if (isManageContext()) {
       writeManageUrl(pages, query.props);
@@ -982,6 +1024,7 @@
     var originalMore = proto.more;
 
     proto.sync = function (method, model, options) {
+      this._mlsPersistGen = persistGeneration;
       if (this.args && Object.prototype.hasOwnProperty.call(this.args, queryVar)) {
         delete this.args[queryVar];
       }
@@ -1026,6 +1069,7 @@
 
     proto.more = function (options) {
       var query = this;
+      query._mlsPersistGen = persistGeneration;
 
       // Gutenberg MediaUpload.updateCollection() wipes visible models, forces
       // _hasMore, then more(). If the mirrored query is empty, treat like the
@@ -1604,6 +1648,56 @@
       }
     );
   }
+
+  /* ------------------------------------------------------------------ */
+  /* Public API — Clear filters (used by cloakwp/core when present)     */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Drop persisted filter params from the upload.php URL and reset
+   * in-memory modal filter state. Does not change Backbone props —
+   * callers should clear those first, then pass the resulting props
+   * so the URL / modal snapshot match.
+   *
+   * @param {Object|undefined} propsSource
+   */
+  function beginClear() {
+    if (!clearInProgress) {
+      persistGeneration += 1;
+      clearInProgress = true;
+    }
+  }
+
+  function clearPersistedFilters(propsSource) {
+    var source = propsSource || {};
+    beginClear();
+    clearInProgress = false;
+
+    if (isManageContext()) {
+      Object.keys(readUrlFilters()).forEach(function (key) {
+        if (managedFilterKeys.indexOf(key) === -1) {
+          managedFilterKeys.push(key);
+        }
+      });
+      writeManageUrl(1, source);
+      manageFingerprint = fingerprintProps(source);
+    }
+
+    if (persistModals && activeModalKey) {
+      var picked = pickQueryProps(source);
+      modalStates.set(activeModalKey, {
+        pages: 1,
+        scrollTop: 0,
+        queryProps: picked,
+        fingerprint: fingerprintProps(picked),
+      });
+    }
+  }
+
+  window.cloakwpMediaLibraryState = {
+    beginClear: beginClear,
+    clearFilters: clearPersistedFilters,
+  };
 
   /* ------------------------------------------------------------------ */
   /* Boot                                                               */

@@ -97,6 +97,19 @@ add_filter('cloakwp/media-library-state/config', function ($config) {
 });
 ```
 
+## JavaScript API
+
+When the admin script is enqueued, it exposes `window.cloakwpMediaLibraryState`:
+
+```js
+// After the listing props have been reset, sync the persisted URL / modal snapshot.
+if (window.cloakwpMediaLibraryState && typeof cloakwpMediaLibraryState.clearFilters === 'function') {
+  cloakwpMediaLibraryState.clearFilters(library.props); // or {} to drop every filter param
+}
+```
+
+`clearFilters(propsSource)` removes filter query params (and `media_pages`) from the `upload.php` grid URL via `history.replaceState`, and resets the in-memory filter snapshot for the open modal. It does **not** change Backbone library props — the caller (e.g. cloakwp/core **Clear**) should reset those first, then pass the resulting props so the URL matches. `mode`, `item`, and other reserved core params are left alone.
+
 ## How restore works
 
 Media Library loads in pages (typically 80 items). Reopening at “page 5” by clicking Load more four times is slow and fragile. Instead, the first `query-attachments` request is inflated to `posts_per_page × N`, then the per-page size is restored so subsequent **Load more** calls page normally.
