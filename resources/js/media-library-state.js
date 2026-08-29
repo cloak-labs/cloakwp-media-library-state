@@ -176,8 +176,27 @@
     return filters;
   }
 
+  function isManageGridFrame() {
+    try {
+      var browse = window.wp && wp.media && wp.media.frames && wp.media.frames.browse;
+      return !!(
+        browse &&
+        wp.media.view &&
+        wp.media.view.MediaFrame &&
+        wp.media.view.MediaFrame.Manage &&
+        browse instanceof wp.media.view.MediaFrame.Manage
+      );
+    } catch (e) {
+      return false;
+    }
+  }
+
   function writeManageUrl(pages, propsSource) {
-    if (!persistUrl || !isUploadScreen || activeModalKey || !window.history || !history.replaceState) {
+    if (!persistUrl || !isUploadScreen || !window.history || !history.replaceState) {
+      return;
+    }
+    // Only block when a real picker modal is active (not the Manage grid).
+    if (activeModalKey && !isManageGridFrame()) {
       return;
     }
     if (suppressUrlWrite) {
@@ -214,7 +233,14 @@
   }
 
   function isManageContext() {
-    return isUploadScreen && persistUrl && !activeModalKey;
+    if (!isUploadScreen || !persistUrl) {
+      return false;
+    }
+    // Standalone grid wins even if a buggy modal bind left activeModalKey set.
+    if (isManageGridFrame()) {
+      return true;
+    }
+    return !activeModalKey;
   }
 
   function getAttachmentsScroller($root) {
@@ -565,24 +591,26 @@
     }
 
     suppressUrlWrite = true;
-    if (library.props.get(queryVar) != null) {
-      library.props.unset(queryVar);
+    try {
+      if (library.props.get(queryVar) != null) {
+        library.props.unset(queryVar);
+      }
+      var patch = {};
+      if (!library.props.get('order')) {
+        patch.order = 'DESC';
+      }
+      if (!library.props.get('orderby')) {
+        patch.orderby = 'date';
+      }
+      if (Object.keys(patch).length) {
+        library.props.set(patch);
+      }
+      // Re-run AttachmentFilters.select() listeners.
+      library.props.trigger('change');
+      restoreSearchInput(library.props.get('search'));
+    } finally {
+      suppressUrlWrite = false;
     }
-    var patch = {};
-    if (!library.props.get('order')) {
-      patch.order = 'DESC';
-    }
-    if (!library.props.get('orderby')) {
-      patch.orderby = 'date';
-    }
-    if (Object.keys(patch).length) {
-      library.props.set(patch);
-    }
-    // Re-run AttachmentFilters.select() listeners.
-    library.props.trigger('change');
-    suppressUrlWrite = false;
-
-    restoreSearchInput(library.props.get('search'));
   }
 
   function bindManageLibrary(library) {
@@ -652,6 +680,20 @@
     if (!frame || frame._mediaLibraryStateBound || typeof frame.on !== 'function') {
       return;
     }
+
+    // upload.php Manage grid is not a picker modal — binding it would set
+    // activeModalKey permanently and block media_pages / filter URL writes.
+    if (
+      window.wp &&
+      wp.media &&
+      wp.media.view &&
+      wp.media.view.MediaFrame &&
+      wp.media.view.MediaFrame.Manage &&
+      frame instanceof wp.media.view.MediaFrame.Manage
+    ) {
+      return;
+    }
+
     frame._mediaLibraryStateBound = true;
 
     frame.on('open', function () {
