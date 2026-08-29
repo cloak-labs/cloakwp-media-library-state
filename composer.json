@@ -1,6 +1,6 @@
 {
   "name": "cloakwp/media-library-state",
-  "description": "Persist Media Library Load more depth across reloads and media modal reopenings.",
+  "description": "Persist WordPress Media Library Load more depth, filters, and scroll across grid reloads and media modal reopenings (ACF, featured image, Gutenberg).",
   "license": "LGPL-3.0-only",
   "type": "wordpress-muplugin",
   "authors": [

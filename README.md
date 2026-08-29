@@ -1,8 +1,39 @@
 # Media Library State
 
-Remember where you are in the WordPress Media Library. **Load more** depth survives page reloads on the grid, and media modal reopenings in the block editor / ACF fields.
+WordPress Media Library state that survives the things that usually wipe it: reloading the grid, closing an attachment details modal, and reopening a media picker after you’ve already hit **Load more** a bunch of times.
 
-Configured in PHP, no settings UI, no admin notices, no premium upsells.
+If you’ve ever scrolled five hundred images deep in an ACF image field, picked something, decided it was wrong, closed the modal, opened it again — and found yourself back at the top with every page unloaded — this is for that. Same pain shows up with galleries, featured image, and Gutenberg media pickers. The grid on `upload.php` has a milder version of it: filters and Load more depth disappear on refresh unless they’re in the URL.
+
+Configured in PHP. No settings UI, no admin notices.
+
+## What it does
+
+### Media Library grid (`upload.php`)
+
+- Each **Load more** writes `?media_pages=N` into the current tab URL via `history.replaceState` (no Back-button spam).
+- Active filters (type, date, search, and custom CloakWP filters such as orientation / media categories) are kept in the same URL alongside `media_pages`.
+- Reloading the tab — or opening the URL elsewhere — restores filters and fetches the previously loaded depth in one request, then **Load more** continues from there.
+- When `media_pages > 1` after a reload, the page scrolls to the bottom (where Load more lives).
+- Core’s `?item={id}` attachment details routing still works. Closing that modal restores your prior grid URL (filters + `media_pages`), instead of core’s bare `upload.php` / `?search=` reset.
+
+### Media modals (block editor, ACF, featured image)
+
+Opening the Media Library from Gutenberg, an ACF Image / Gallery / File field, or Featured Image remembers, **per instance**, for the current editor session:
+
+- **Load more** depth
+- Active library filters
+- Scroll position (when there’s nothing better to aim at)
+- Scroll-to-selection on reopen: featured image scrolls to the current featured attachment; ACF galleries scroll to the last selected image; image fields scroll to their current value when set
+
+Instances are scoped so they don’t bleed into each other:
+
+| Opener | Scope |
+| --- | --- |
+| ACF Image / Gallery / File | That field instance (repeater / flexible rows included) |
+| Featured image | One shared `featured-image` key |
+| Other Gutenberg / `wp.media` pickers | Selected block `clientId`, or a generic `select` fallback |
+
+State is in-memory for the editor session. It does not survive a full page reload of the editor.
 
 ## Install paths
 
@@ -64,8 +95,8 @@ Same defaults as the Composer path. Developers can still override config via flu
 MediaLibraryState::make()
   ->queryVar('media_pages')  // URL param on upload.php grid
   ->maxPages(10)             // cap restored first-query size (pages × 80 items)
-  ->persistUrl(true)         // write media_pages into the grid URL
-  ->persistModals(true)      // remember Load more depth per modal instance
+  ->persistUrl(true)         // write media_pages + filters into the grid URL
+  ->persistModals(true)      // remember Load more / filters / scroll per modal instance
   ->register();
 ```
 
@@ -77,24 +108,16 @@ add_filter('cloakwp/media-library-state/config', function ($config) {
 });
 ```
 
-## What it does
+## How restore works
 
-### Media Library grid (`upload.php`)
+Media Library loads in pages (typically 80 items). Reopening at “page 5” by clicking Load more four times is slow and fragile. Instead, the first `query-attachments` request is inflated to `posts_per_page × N`, then the per-page size is restored so subsequent **Load more** calls page normally.
 
-Each **Load more** updates the current tab URL with `?media_pages=N` via `history.replaceState` (no Back-button spam). Active filters (type, date, search, and custom CloakWP filters such as orientation / media categories) are written into the same URL. Reloading the same tab — or opening the URL in a new tab — restores those filters and fetches all previously loaded pages in one request, then continues from there.
+On the grid, `N` comes from `?media_pages=`. In modals, `N` comes from the in-memory map for that instance key.
 
-When `media_pages` is greater than 1 after a reload, the grid scrolls to the bottom (where Load more lives).
-
-### Media modals (block editor, ACF Image/Gallery/File)
-
-Opening the Media Library from a Gutenberg image block, ACF field, or featured image remembers **Load more** depth, scroll, and active filters for that instance in memory for the current editor session. Opening the picker for a *different* block or field starts fresh (or restores that instance’s own state).
-
-State does not survive a full editor reload (Gutenberg regenerates block `clientId`s).
-
-### Out of scope (MVP)
+## Out of scope
 
 - List-view pagination (core already has `paged`)
-- Selected attachment (core already has `item=`)
+- Persisting modal state across full editor reloads
 
 ## Architecture
 
