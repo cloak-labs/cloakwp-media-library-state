@@ -2,27 +2,26 @@
 
 WordPress Media Library state that survives the things that usually wipe it: reloading the grid, closing an attachment details modal, and reopening a media picker after you’ve already hit **Load more** a bunch of times.
 
-If you’ve ever scrolled five hundred images deep in an ACF image field, picked something, decided it was wrong, closed the modal, opened it again — and found yourself back at the top with every page unloaded — this is for that. Same pain shows up with galleries, featured image, and Gutenberg media pickers. The grid on `upload.php` has a milder version of it: filters and Load more depth disappear on refresh unless they’re in the URL.
+If you’ve ever scrolled five hundred images deep in an ACF image field, picked something, closed the modal, decided it was wrong, opened it again — and found yourself back at the top with all the previously loaded images gone — this is for that. Same pain shows up with galleries, featured image, and Gutenberg media pickers. The grid on `upload.php` has a milder version of it: filters and Load more depth disappear on refresh.
 
-Configured in PHP. No settings UI, no admin notices.
+Configured in PHP. No settings UI, no admin notices, no premium upsells.
 
 ## What it does
 
 ### Media Library grid (`upload.php`)
 
 - Each **Load more** writes `?media_pages=N` into the current tab URL via `history.replaceState` (no Back-button spam).
-- Active filters (type, date, search, and custom CloakWP filters such as orientation / media categories) are kept in the same URL alongside `media_pages`.
+- Active filters (type, date, search, and custom filters created via `cloakwp/core` package's `LibraryFilters`) are kept in the same URL alongside `media_pages`.
 - Reloading the tab — or opening the URL elsewhere — restores filters and fetches the previously loaded depth in one request, then **Load more** continues from there.
 - When `media_pages > 1` after a reload, the page scrolls to the bottom (where Load more lives).
-- Core’s `?item={id}` attachment details routing still works. Closing that modal restores your prior grid URL (filters + `media_pages`), instead of core’s bare `upload.php` / `?search=` reset.
+- Clicking an item (opening the attachment modal) still appends `?item={id}` to the URL (core behaviour); closing that modal restores your prior grid URL params (filters + `media_pages`), instead of core’s bare `upload.php` / `?search=` reset.
 
 ### Media modals (block editor, ACF, featured image)
 
-Opening the Media Library from Gutenberg, an ACF Image / Gallery / File field, or Featured Image remembers, **per instance**, for the current editor session:
+Opening the Media Library from Gutenberg, an ACF Image / Gallery / File field, or Featured Image remembers the following, **per instance**, for the current editor session:
 
 - **Load more** depth
 - Active library filters
-- Scroll position (when there’s nothing better to aim at)
 - Scroll-to-selection on reopen: featured image scrolls to the current featured attachment; ACF galleries scroll to the last selected image; image fields scroll to their current value when set
 
 Instances are scoped so they don’t bleed into each other:
@@ -63,17 +62,7 @@ wp-content/mu-plugins/media-library-state/
 require WPMU_PLUGIN_DIR . '/media-library-state/media-library-state.php';
 ```
 
-Optional fluent config in your theme `functions.php` (runs before the deferred default boot):
-
-```php
-use CloakWP\MediaLibraryState\MediaLibraryState;
-
-MediaLibraryState::make()
-  ->maxPages(10)
-  ->register();
-```
-
-If you never call `register()`, the plugin bootstrap starts with defaults on `init` priority 1.
+If you never call `MediaLibraryState::make()->register()`, the plugin bootstrap starts with defaults on `init` priority 1. See [Fluent API](#fluent-api) for optional config.
 
 ### 2. Traditional plugin install (download as a zip)
 
