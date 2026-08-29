@@ -1,7 +1,8 @@
 /**
- * Media Library State — persist Load more depth.
+ * Media Library State — persist Load more depth + upload.php filters.
  *
- * - upload.php grid: media_pages URL param via history.replaceState + sessionStorage scroll
+ * - upload.php grid: media_pages + filter props in the URL via history.replaceState;
+ *   when media_pages > 1 after reload, scroll to the bottom of the grid
  * - Media modals (Gutenberg / ACF / featured image): per-instance in-memory pages + scroll + filters
  *
  * Restore strategy: inflate the first query-attachments request to posts_per_page * N,
@@ -21,7 +22,18 @@
   var persistModals = settings.persistModals !== false;
   var isUploadScreen = !!settings.isUploadScreen;
 
-  var SCROLL_STORAGE_KEY = 'cloakwp.mediaLibraryState.scroll';
+  /** Core upload.php params we never treat as media filters. */
+  var RESERVED_URL_PARAMS = {
+    mode: true,
+    item: true,
+    action: true,
+    paged: true,
+    post_type: true,
+    filter_action: true,
+    _wpnonce: true,
+    _wp_http_referer: true,
+  };
+  RESERVED_URL_PARAMS[queryVar] = true;
 
   /** @type {Map<string, {pages:number, scrollTop:number, queryProps:Object, fingerprint:string}>} */
   var modalStates = new Map();
@@ -29,8 +41,14 @@
   /** Active modal instance key while a select/featured frame is open. */
   var activeModalKey = null;
 
-  /** Fingerprint of the manage-screen query that used the URL restore. */
+  /** Fingerprint of the manage-screen query currently reflected in the URL. */
   var manageFingerprint = null;
+
+  /** Filter param keys we last wrote (so we can clear stale ones). */
+  var managedFilterKeys = [];
+
+  /** Skip writing the URL while applying restored filters. */
+  var suppressUrlWrite = false;
 
   /** Keys already restored this modal open (inflate once per open). */
   var restoredThisOpen = Object.create(null);
@@ -38,7 +56,7 @@
   /** Last ACF field element clicked — for instance-scoped keys. */
   var lastAcfFieldEl = null;
 
-  /** Pending scroll restore after attachments render. */
+  /** Pending scroll restore (modals: exact top; manage: bottom). */
   var pendingScroll = null;
 
   /* ------------------------------------------------------------------ */
@@ -65,59 +83,26 @@
     }
   }
 
-  function writeUrlPages(pages) {
-    if (!persistUrl || !isUploadScreen || !window.history || !history.replaceState) {
-      return;
-    }
-    try {
-      var url = new URL(window.location.href);
-      pages = clampPages(pages);
-      if (pages <= 1) {
-        url.searchParams.delete(queryVar);
-      } else {
-        url.searchParams.set(queryVar, String(pages));
-      }
-      history.replaceState(null, '', url.toString());
-    } catch (e) {
-      // Ignore malformed URLs.
-    }
-  }
-
-  function saveManageScroll(scrollTop) {
-    if (!isUploadScreen || !window.sessionStorage) {
-      return;
-    }
-    try {
-      sessionStorage.setItem(
-        SCROLL_STORAGE_KEY,
-        JSON.stringify({ scrollTop: scrollTop, pages: readUrlPages() })
-      );
-    } catch (e) {
-      // Quota / private mode.
-    }
-  }
-
-  function loadManageScroll() {
-    if (!isUploadScreen || !window.sessionStorage) {
+  function coerceFilterValue(key, value) {
+    if (value === null || value === undefined || value === '') {
       return null;
     }
-    try {
-      var raw = sessionStorage.getItem(SCROLL_STORAGE_KEY);
-      if (!raw) {
-        return null;
-      }
-      var data = JSON.parse(raw);
-      if (!data || typeof data.scrollTop !== 'number') {
-        return null;
-      }
-      return data;
-    } catch (e) {
-      return null;
+    if (
+      key === 'year' ||
+      key === 'monthnum' ||
+      key === 'uploadedTo' ||
+      key === 'author' ||
+      key === 'parent' ||
+      key === 'menuOrder'
+    ) {
+      var num = parseInt(value, 10);
+      return isNaN(num) ? value : num;
     }
+    return value;
   }
 
   /**
-   * Props that define the attachment listing (exclude refresh noise).
+   * Props that define the attachment listing (exclude refresh / sort noise).
    */
   function pickQueryProps(props) {
     var out = {};
@@ -131,11 +116,17 @@
           ? props
           : {};
     Object.keys(source).forEach(function (key) {
-      if (key === 'ignore' || key === 'order' || key === 'orderby' || key === 'queryOrderbyCache') {
+      if (
+        key === 'ignore' ||
+        key === 'order' ||
+        key === 'orderby' ||
+        key === 'queryOrderbyCache' ||
+        key === 'menuOrder'
+      ) {
         return;
       }
       var val = source[key];
-      if (val === null || val === undefined || val === '') {
+      if (val === null || val === undefined || val === '' || val === false) {
         return;
       }
       out[key] = val;
@@ -163,6 +154,63 @@
     return '';
   }
 
+  function readUrlFilters() {
+    var filters = {};
+    try {
+      var params = new URLSearchParams(window.location.search);
+      params.forEach(function (value, key) {
+        if (RESERVED_URL_PARAMS[key]) {
+          return;
+        }
+        var coerced = coerceFilterValue(key, value);
+        if (coerced === null) {
+          return;
+        }
+        filters[key] = coerced;
+      });
+    } catch (e) {
+      // Ignore.
+    }
+    return filters;
+  }
+
+  function writeManageUrl(pages, propsSource) {
+    if (!persistUrl || !isUploadScreen || activeModalKey || !window.history || !history.replaceState) {
+      return;
+    }
+    if (suppressUrlWrite) {
+      return;
+    }
+    try {
+      var url = new URL(window.location.href);
+      var props = pickQueryProps(propsSource);
+
+      managedFilterKeys.forEach(function (key) {
+        url.searchParams.delete(key);
+      });
+      managedFilterKeys = [];
+
+      Object.keys(props).forEach(function (key) {
+        if (RESERVED_URL_PARAMS[key]) {
+          return;
+        }
+        url.searchParams.set(key, String(props[key]));
+        managedFilterKeys.push(key);
+      });
+
+      pages = clampPages(pages);
+      if (pages <= 1) {
+        url.searchParams.delete(queryVar);
+      } else {
+        url.searchParams.set(queryVar, String(pages));
+      }
+
+      history.replaceState(null, '', url.toString());
+    } catch (e) {
+      // Ignore malformed URLs.
+    }
+  }
+
   function isManageContext() {
     return isUploadScreen && persistUrl && !activeModalKey;
   }
@@ -180,10 +228,18 @@
     if (typeof scrollTop !== 'number' || scrollTop <= 0) {
       return;
     }
-    pendingScroll = { scrollTop: scrollTop, $root: $root || null };
+    pendingScroll = { mode: 'top', scrollTop: scrollTop, $root: $root || null };
     window.setTimeout(applyPendingScroll, 50);
     window.setTimeout(applyPendingScroll, 250);
     window.setTimeout(applyPendingScroll, 600);
+  }
+
+  function scheduleScrollToBottom($root) {
+    pendingScroll = { mode: 'bottom', $root: $root || null, attempts: 0 };
+    window.setTimeout(applyPendingScroll, 50);
+    window.setTimeout(applyPendingScroll, 250);
+    window.setTimeout(applyPendingScroll, 600);
+    window.setTimeout(applyPendingScroll, 1200);
   }
 
   function applyPendingScroll() {
@@ -194,8 +250,18 @@
     if (!$el.length) {
       return;
     }
+
+    if (pendingScroll.mode === 'bottom') {
+      var height = $el.prop('scrollHeight') || 0;
+      $el.scrollTop(height);
+      pendingScroll.attempts = (pendingScroll.attempts || 0) + 1;
+      if (height > ($el.innerHeight() || 0) + 40 || pendingScroll.attempts >= 4) {
+        pendingScroll = null;
+      }
+      return;
+    }
+
     $el.scrollTop(pendingScroll.scrollTop);
-    // Clear once the scroller has content tall enough, or after last attempt.
     if ($el.prop('scrollHeight') > pendingScroll.scrollTop + 40) {
       pendingScroll = null;
     }
@@ -276,7 +342,7 @@
       }
       if (fingerprint !== manageFingerprint) {
         manageFingerprint = fingerprint;
-        writeUrlPages(1);
+        writeManageUrl(1, query.props);
         return 1;
       }
       // Same listing (e.g. ignore refresh) — stay at current URL depth.
@@ -320,7 +386,10 @@
     pages = clampPages(pages);
 
     if (isManageContext()) {
-      writeUrlPages(pages);
+      writeManageUrl(pages, query.props);
+      if (pages > 1) {
+        scheduleScrollToBottom(null);
+      }
       return;
     }
 
@@ -417,6 +486,109 @@
     };
 
     proto._mediaLibraryStatePatched = true;
+    return true;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Manage screen: restore filters from URL before first query         */
+  /* ------------------------------------------------------------------ */
+
+  function restoreSearchInput(search) {
+    if (!search) {
+      return;
+    }
+    var $input = $('#media-search-input');
+    if ($input.length) {
+      $input.val(search);
+    }
+  }
+
+  function onManagePropsChange() {
+    if (suppressUrlWrite || !isManageContext()) {
+      return;
+    }
+    var props = this;
+    var fingerprint = fingerprintProps(props);
+    if (fingerprint !== manageFingerprint) {
+      manageFingerprint = fingerprint;
+      writeManageUrl(1, props);
+    } else {
+      writeManageUrl(readUrlPages(), props);
+    }
+  }
+
+  function applyManageFiltersFromUrl(library) {
+    if (!library || !library.props || typeof library.props.set !== 'function') {
+      return;
+    }
+
+    var filters = readUrlFilters();
+    managedFilterKeys = Object.keys(filters);
+
+    if (Object.keys(filters).length) {
+      suppressUrlWrite = true;
+      library.props.set(filters);
+      suppressUrlWrite = false;
+    }
+
+    manageFingerprint = fingerprintProps(library.props);
+
+    if (typeof library.props.off === 'function') {
+      library.props.off('change.mediaLibraryState');
+    }
+    library.props.on('change.mediaLibraryState', onManagePropsChange);
+
+    if (filters.search) {
+      window.setTimeout(function () {
+        restoreSearchInput(filters.search);
+      }, 0);
+    }
+  }
+
+  function patchManageFrame() {
+    if (!isUploadScreen || !persistUrl) {
+      return false;
+    }
+    if (!window.wp || !wp.media || !wp.media.view || !wp.media.view.MediaFrame) {
+      return false;
+    }
+    var Manage = wp.media.view.MediaFrame.Manage;
+    if (!Manage || !Manage.prototype) {
+      return false;
+    }
+    if (Manage.prototype._mediaLibraryStatePatched) {
+      return true;
+    }
+
+    var originalInitialize = Manage.prototype.initialize;
+    Manage.prototype.initialize = function () {
+      originalInitialize.apply(this, arguments);
+
+      var state = typeof this.state === 'function' ? this.state() : null;
+      var library = state && typeof state.get === 'function' ? state.get('library') : null;
+      if (library) {
+        applyManageFiltersFromUrl(library);
+      }
+
+      this.on('content:activate:browse', function () {
+        var browser = null;
+        try {
+          browser = this.content.get();
+        } catch (e) {
+          return;
+        }
+        if (!browser || !browser.collection) {
+          return;
+        }
+        if (manageFingerprint === null) {
+          applyManageFiltersFromUrl(browser.collection);
+        }
+        var search = browser.collection.props && browser.collection.props.get('search');
+        restoreSearchInput(search);
+      });
+    };
+
+    Manage.prototype._mediaLibraryStatePatched = true;
     return true;
   }
 
@@ -539,61 +711,26 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Manage screen scroll                                               */
-  /* ------------------------------------------------------------------ */
-
-  function initManageScroll() {
-    if (!isUploadScreen) {
-      return;
-    }
-
-    var saved = loadManageScroll();
-    if (saved && saved.scrollTop > 0) {
-      scheduleScrollRestore(saved.scrollTop, null);
-    }
-
-    var scrollTimer = null;
-    $(document).on('scroll.mediaLibraryState', '.attachments-browser .attachments', function () {
-      var $el = $(this);
-      window.clearTimeout(scrollTimer);
-      scrollTimer = window.setTimeout(function () {
-        saveManageScroll($el.scrollTop());
-      }, 150);
-    });
-
-    // jQuery delegated scroll does not bubble — bind directly when browser appears.
-    var observer = null;
-    if (typeof MutationObserver === 'function') {
-      observer = new MutationObserver(function () {
-        var $el = getAttachmentsScroller(null);
-        if ($el.length && !$el.data('mlsScrollBound')) {
-          $el.data('mlsScrollBound', true);
-          $el.on('scroll.mediaLibraryState', function () {
-            window.clearTimeout(scrollTimer);
-            scrollTimer = window.setTimeout(function () {
-              saveManageScroll($el.scrollTop());
-            }, 150);
-          });
-        }
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
-    }
-  }
-
-  /* ------------------------------------------------------------------ */
   /* Boot                                                               */
   /* ------------------------------------------------------------------ */
 
   function boot() {
+    managedFilterKeys = Object.keys(readUrlFilters());
     ensureQueryPatch();
+    patchManageFrame();
     patchMediaFactory();
     bindAcfPopups();
-    initManageScroll();
+
+    // Reload with media_pages already set — scroll once attachments inflate.
+    if (isUploadScreen && readUrlPages() > 1) {
+      scheduleScrollToBottom(null);
+    }
   }
 
   if (!ensureQueryPatch()) {
     $(boot);
   } else {
+    patchManageFrame();
     patchMediaFactory();
     bindAcfPopups();
   }

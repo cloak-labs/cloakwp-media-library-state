@@ -81,9 +81,9 @@ add_filter('cloakwp/media-library-state/config', function ($config) {
 
 ### Media Library grid (`upload.php`)
 
-Each **Load more** updates the current tab URL with `?media_pages=N` via `history.replaceState` (no Back-button spam). Reloading the same tab — or opening the URL in a new tab — fetches all previously loaded pages in one request, then continues from there.
+Each **Load more** updates the current tab URL with `?media_pages=N` via `history.replaceState` (no Back-button spam). Active filters (type, date, search, and custom CloakWP filters such as orientation / media categories) are written into the same URL. Reloading the same tab — or opening the URL in a new tab — restores those filters and fetches all previously loaded pages in one request, then continues from there.
 
-Same-tab scroll position is restored via `sessionStorage`.
+When `media_pages` is greater than 1 after a reload, the grid scrolls to the bottom (where Load more lives).
 
 ### Media modals (block editor, ACF Image/Gallery/File)
 
@@ -93,7 +93,6 @@ State does not survive a full editor reload (Gutenberg regenerates block `client
 
 ### Out of scope (MVP)
 
-- Persisting type / date / search / category filters into the grid URL
 - List-view pagination (core already has `paged`)
 - Selected attachment (core already has `item=`)
 
