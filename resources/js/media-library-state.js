@@ -44,6 +44,13 @@
   /** Fingerprint of the manage-screen query currently reflected in the URL. */
   var manageFingerprint = null;
 
+  /**
+   * Backbone fragment for the manage grid URL (e.g. upload.php?mode=grid&media_pages=2).
+   * Core EditAttachments.resetRoute navigates to bare upload.php / ?search= and would
+   * otherwise drop filters + media_pages when closing an item modal.
+   */
+  var lastManageFragment = null;
+
   /** Filter param keys we last wrote (so we can clear stale ones). */
   var managedFilterKeys = [];
 
@@ -56,8 +63,18 @@
   /** Last ACF field element clicked — for instance-scoped keys. */
   var lastAcfFieldEl = null;
 
-  /** Pending scroll restore (modals: exact top; manage: bottom). */
+  /**
+   * Pending modal kind from a click that opens media (e.g. featured image).
+   * Consumed in resolveModalKey so Gutenberg MediaUpload frames (which are not
+   * wp.media.featuredImage._frame) still get a stable key.
+   */
+  var pendingModalKind = null;
+
+  /** Pending scroll restore (modals: exact top / attachment; manage: bottom). */
   var pendingScroll = null;
+
+  /** Attachment ids to bring into view after a modal library finishes loading. */
+  var pendingFocusAttachmentIds = null;
 
   /* ------------------------------------------------------------------ */
   /* Helpers                                                            */
@@ -123,6 +140,7 @@
         key === 'queryOrderbyCache' ||
         key === 'menuOrder' ||
         key === 'query' ||
+        key === '_acfuploader' ||
         key === queryVar
       ) {
         return;
@@ -191,6 +209,53 @@
     }
   }
 
+  /**
+   * Remember the current manage-grid URL (minus ?item=) so we can restore it
+   * when the attachment details modal closes.
+   */
+  function snapshotManageLocation(pathAndSearch) {
+    if (!persistUrl || !isUploadScreen) {
+      return;
+    }
+    try {
+      var pathSearch = pathAndSearch;
+      if (!pathSearch) {
+        var url = new URL(window.location.href);
+        if (url.searchParams.has('item')) {
+          return;
+        }
+        pathSearch = url.pathname + url.search + url.hash;
+      }
+      var adminUrl =
+        window._wpMediaGridSettings && _wpMediaGridSettings.adminUrl
+          ? String(_wpMediaGridSettings.adminUrl)
+          : '';
+      if (adminUrl && pathSearch.indexOf(adminUrl) === 0) {
+        lastManageFragment = pathSearch.slice(adminUrl.length);
+      } else if (pathSearch.indexOf('upload.php') !== -1) {
+        lastManageFragment = pathSearch.replace(/^.*?(upload\.php)/, 'upload.php');
+      } else {
+        lastManageFragment = 'upload.php' + (pathSearch.indexOf('?') >= 0 ? pathSearch.slice(pathSearch.indexOf('?')) : '');
+      }
+    } catch (e) {
+      // Ignore.
+    }
+  }
+
+  function fragmentToPathAndSearch(fragment) {
+    var adminUrl =
+      window._wpMediaGridSettings && _wpMediaGridSettings.adminUrl
+        ? String(_wpMediaGridSettings.adminUrl)
+        : '';
+    if (!fragment) {
+      return '';
+    }
+    if (fragment.charAt(0) === '/') {
+      return fragment;
+    }
+    return adminUrl ? adminUrl.replace(/\/?$/, '/') + fragment.replace(/^\//, '') : '/' + fragment;
+  }
+
   function writeManageUrl(pages, propsSource) {
     if (!persistUrl || !isUploadScreen || !window.history || !history.replaceState) {
       return;
@@ -204,6 +269,13 @@
     }
     try {
       var url = new URL(window.location.href);
+
+      // Core Manage uses Backbone.history for ?item= / ?search= routes.
+      // Never rewrite while an attachment is open — keep lastManageFragment.
+      if (url.searchParams.has('item')) {
+        return;
+      }
+
       var props = pickQueryProps(propsSource);
 
       managedFilterKeys.forEach(function (key) {
@@ -226,7 +298,30 @@
         url.searchParams.set(queryVar, String(pages));
       }
 
-      history.replaceState(null, '', url.toString());
+      var pathAndSearch = url.pathname + url.search + url.hash;
+      var adminUrl =
+        window._wpMediaGridSettings && _wpMediaGridSettings.adminUrl
+          ? String(_wpMediaGridSettings.adminUrl)
+          : '';
+      var fragment = pathAndSearch;
+      if (adminUrl && pathAndSearch.indexOf(adminUrl) === 0) {
+        fragment = pathAndSearch.slice(adminUrl.length);
+      }
+
+      snapshotManageLocation(pathAndSearch);
+
+      // Keep Backbone's fragment in sync when Manage has started history.
+      if (
+        window.Backbone &&
+        Backbone.History &&
+        Backbone.History.started &&
+        Backbone.history &&
+        typeof Backbone.history.navigate === 'function'
+      ) {
+        Backbone.history.navigate(fragment, { replace: true, trigger: false });
+      } else {
+        history.replaceState(null, '', pathAndSearch);
+      }
     } catch (e) {
       // Ignore malformed URLs.
     }
@@ -245,11 +340,41 @@
 
   function getAttachmentsScroller($root) {
     var $scope = $root && $root.length ? $root : $(document);
-    var $el = $scope.find('.attachments-browser .attachments').first();
+    // WP 5.8+: with the Load more button, overflow is on .attachments-wrapper
+    // (not .attachments). Infinite-scroll mode still scrolls .attachments.
+    var $el = $scope.find('.attachments-browser.has-load-more .attachments-wrapper').first();
+    if (!$el.length) {
+      $el = $scope.find('.attachments-browser .attachments-wrapper').first();
+    }
+    if (!$el.length) {
+      $el = $scope.find('.attachments-browser .attachments').first();
+    }
     if (!$el.length) {
       $el = $scope.find('.media-frame .attachments').first();
     }
     return $el;
+  }
+
+  function findAttachmentEl(attachmentIds, $root) {
+    var ids = normalizeAttachmentIds(attachmentIds);
+    if (!ids.length) {
+      return $();
+    }
+    var $scope =
+      $root && $root.length
+        ? $root
+        : $('.media-modal:visible, .media-frame:visible').last();
+    if (!$scope.length) {
+      $scope = $(document);
+    }
+    // Prefer the last id (gallery: last selected; featured/image: single).
+    for (var i = ids.length - 1; i >= 0; i--) {
+      var $attachment = $scope.find('.attachment[data-id="' + ids[i] + '"]').first();
+      if ($attachment.length) {
+        return $attachment;
+      }
+    }
+    return $();
   }
 
   function scheduleScrollRestore(scrollTop, $root) {
@@ -270,6 +395,76 @@
     window.setTimeout(applyPendingScroll, 1200);
   }
 
+  function scheduleScrollToAttachment(attachmentIds, $root) {
+    var ids = normalizeAttachmentIds(attachmentIds);
+    if (!ids.length) {
+      return;
+    }
+    pendingFocusAttachmentIds = ids;
+    pendingScroll = {
+      mode: 'attachment',
+      attachmentIds: ids,
+      $root: $root || null,
+      attempts: 0,
+    };
+    window.setTimeout(applyPendingScroll, 50);
+    window.setTimeout(applyPendingScroll, 250);
+    window.setTimeout(applyPendingScroll, 600);
+    window.setTimeout(applyPendingScroll, 1200);
+    window.setTimeout(applyPendingScroll, 2000);
+    window.setTimeout(applyPendingScroll, 3500);
+  }
+
+  function normalizeAttachmentIds(ids) {
+    var out = [];
+    if (!ids) {
+      return out;
+    }
+    var list = Object.prototype.toString.call(ids) === '[object Array]' ? ids : [ids];
+    list.forEach(function (id) {
+      if (id === null || id === undefined || id === '') {
+        return;
+      }
+      if (typeof id === 'object' && id.id != null) {
+        id = id.id;
+      }
+      id = String(id);
+      if (id === '0' || id === '-1') {
+        return;
+      }
+      if (out.indexOf(id) === -1) {
+        out.push(id);
+      }
+    });
+    return out;
+  }
+
+  function scrollAttachmentIntoView($scroller, $attachment) {
+    if (!$scroller.length || !$attachment.length) {
+      return false;
+    }
+    var scrollerEl = $scroller.get(0);
+    var attEl = $attachment.get(0);
+    if (!scrollerEl || !attEl) {
+      return false;
+    }
+
+    var scrollerRect = scrollerEl.getBoundingClientRect();
+    var attRect = attEl.getBoundingClientRect();
+    // Skip if layout isn't ready yet (zero-size scroller).
+    if (scrollerRect.height < 40) {
+      return false;
+    }
+
+    var next =
+      scrollerEl.scrollTop +
+      (attRect.top - scrollerRect.top) -
+      scrollerRect.height / 2 +
+      attRect.height / 2;
+    scrollerEl.scrollTop = Math.max(0, next);
+    return true;
+  }
+
   function applyPendingScroll() {
     if (!pendingScroll) {
       return;
@@ -286,6 +481,33 @@
         height > (window.innerHeight || 0) + 40 ||
         pendingScroll.attempts >= 4
       ) {
+        pendingScroll = null;
+      }
+      return;
+    }
+
+    if (pendingScroll.mode === 'attachment') {
+      var $attachment = findAttachmentEl(
+        pendingScroll.attachmentIds,
+        pendingScroll.$root
+      );
+      if ($attachment.length) {
+        var $scroller = getAttachmentsScroller(
+          pendingScroll.$root && pendingScroll.$root.length
+            ? pendingScroll.$root
+            : $attachment.closest('.media-frame, .media-modal')
+        );
+        if (!$scroller.length) {
+          $scroller = $attachment.closest('.attachments-wrapper, .attachments');
+        }
+        if (scrollAttachmentIntoView($scroller, $attachment)) {
+          pendingScroll = null;
+          pendingFocusAttachmentIds = null;
+          return;
+        }
+      }
+      pendingScroll.attempts = (pendingScroll.attempts || 0) + 1;
+      if (pendingScroll.attempts >= 8) {
         pendingScroll = null;
       }
       return;
@@ -333,14 +555,40 @@
   }
 
   function isFeaturedImageFrame(frame) {
+    if (!frame) {
+      return false;
+    }
+    if (frame._mlsFeaturedImage) {
+      return true;
+    }
     try {
       if (
         window.wp &&
         wp.media &&
         wp.media.featuredImage &&
-        typeof wp.media.featuredImage.frame === 'function'
+        wp.media.featuredImage._frame === frame
       ) {
-        return wp.media.featuredImage.frame() === frame;
+        return true;
+      }
+    } catch (e) {
+      // Fall through.
+    }
+    try {
+      if (frame.options && frame.options.state === 'featured-image') {
+        return true;
+      }
+      if (
+        frame.states &&
+        typeof frame.states.findWhere === 'function' &&
+        frame.states.findWhere({ id: 'featured-image' })
+      ) {
+        return true;
+      }
+      if (typeof frame.state === 'function') {
+        var state = frame.state();
+        if (state && state.id === 'featured-image') {
+          return true;
+        }
       }
     } catch (e) {
       // Fall through.
@@ -348,22 +596,263 @@
     return false;
   }
 
-  function resolveModalKey(frame, acfPopup) {
-    if (acfPopup && typeof acfPopup.get === 'function') {
-      var fieldKey = acfPopup.get('field') || '';
-      var instanceId = '';
-      if (lastAcfFieldEl) {
-        instanceId =
-          lastAcfFieldEl.getAttribute('data-id') ||
-          lastAcfFieldEl.getAttribute('data-key') ||
-          '';
+  /**
+   * Stable per-instance key for an ACF image/file/gallery field.
+   * Field key alone is shared across every repeater/flexible row.
+   * Prefer input name / row path over Backbone cid — empty galleries often
+   * have no inputs, and cid changes when Gutenberg re-renders the block.
+   */
+  function buildAcfInstanceKey(fieldKey, fieldInstance) {
+    var parts = ['acf'];
+    var key = fieldKey || '';
+    var field = fieldInstance || null;
+    var el = lastAcfFieldEl;
+    var fieldType = '';
+
+    if (!field && el && window.acf && typeof acf.getField === 'function') {
+      try {
+        field = acf.getField($(el));
+      } catch (e) {
+        field = null;
       }
-      return 'acf:' + String(fieldKey) + ':' + String(instanceId || fieldKey);
     }
 
-    if (isFeaturedImageFrame(frame)) {
+    if (field && typeof field.get === 'function') {
+      if (!key) {
+        key = field.get('key') || '';
+      }
+      fieldType = field.get('type') || '';
+      if (!el && field.$el && field.$el[0]) {
+        el = field.$el[0];
+      }
+    }
+
+    if (fieldType) {
+      parts.push('t:' + fieldType);
+    }
+
+    // Prefer the hidden input name — stable across Gutenberg block re-renders.
+    if (el) {
+      var $el = $(el);
+      var inputName =
+        $el.find('input[type="hidden"][name^="acf"]').first().attr('name') ||
+        $el.find('[name^="acf"]').first().attr('name') ||
+        '';
+      if (inputName) {
+        // Normalize gallery array names: acf[x][y][] → acf[x][y]
+        inputName = inputName.replace(/\[\]$/, '');
+        parts.push('n:' + inputName);
+        if (key) {
+          parts.push('k:' + key);
+        }
+        return parts.join('|');
+      }
+    }
+
+    var blockId = getSelectedBlockClientId();
+    if (blockId) {
+      parts.push('b:' + blockId);
+    }
+
+    if (key) {
+      parts.push('k:' + key);
+    }
+
+    if (el) {
+      var $row = $(el).closest('.acf-row');
+      if ($row.length) {
+        parts.push('row:' + ($row.attr('data-id') || String($row.index())));
+      }
+      var $layout = $(el).closest('.layout');
+      if ($layout.length) {
+        parts.push('lay:' + ($layout.attr('data-id') || String($layout.index())));
+      }
+      if (key) {
+        var idx = $('.acf-field[data-key="' + key + '"]').index(el);
+        if (idx >= 0) {
+          parts.push('idx:' + idx);
+        }
+      }
+    }
+
+    // Last resort only — cid is unstable across ACF block re-renders.
+    if (parts.length < 3 && field && field.cid) {
+      parts.push('cid:' + field.cid);
+    }
+
+    return parts.join('|');
+  }
+
+  function resolveAcfFieldForPopup(popup) {
+    var fieldKey = popup && typeof popup.get === 'function' ? popup.get('field') || '' : '';
+    var field = null;
+
+    if (lastAcfFieldEl && window.acf && typeof acf.getField === 'function') {
+      try {
+        field = acf.getField($(lastAcfFieldEl));
+      } catch (e) {
+        field = null;
+      }
+      if (field && fieldKey && typeof field.get === 'function' && field.get('key') !== fieldKey) {
+        field = null;
+      }
+    }
+
+    if (!field && fieldKey && window.acf && typeof acf.getFields === 'function') {
+      try {
+        var fields = acf.getFields({ key: fieldKey }) || [];
+        if (fields.length === 1) {
+          field = fields[0];
+        } else if (fields.length && lastAcfFieldEl) {
+          for (var i = 0; i < fields.length; i++) {
+            var candidate = fields[i];
+            if (
+              candidate &&
+              candidate.$el &&
+              candidate.$el[0] &&
+              (candidate.$el[0] === lastAcfFieldEl ||
+                $.contains(candidate.$el[0], lastAcfFieldEl))
+            ) {
+              field = candidate;
+              break;
+            }
+          }
+          if (!field) {
+            field = fields[fields.length - 1];
+          }
+        }
+      } catch (e) {
+        field = null;
+      }
+    }
+
+    if (field && field.$el && field.$el[0]) {
+      lastAcfFieldEl = field.$el[0];
+    }
+
+    return field;
+  }
+
+  function getAcfPopup(frame, acfPopup) {
+    if (acfPopup && typeof acfPopup.get === 'function') {
+      return acfPopup;
+    }
+    if (frame && frame._mlsAcfPopup && typeof frame._mlsAcfPopup.get === 'function') {
+      return frame._mlsAcfPopup;
+    }
+    // ACF sets frame.acf = MediaPopup in MediaPopup.initialize.
+    if (frame && frame.acf && typeof frame.acf.get === 'function') {
+      return frame.acf;
+    }
+    return null;
+  }
+
+  /**
+   * Attachment id(s) to bring into view when reopening a modal that already
+   * has a current value (featured image, image field, gallery).
+   */
+  function getFocusAttachmentIds(frame) {
+    var ids = [];
+
+    function pushId(id) {
+      normalizeAttachmentIds([id]).forEach(function (normalized) {
+        if (ids.indexOf(normalized) === -1) {
+          ids.push(normalized);
+        }
+      });
+    }
+
+    try {
+      if (frame && (frame._mlsFeaturedImage || isFeaturedImageFrame(frame))) {
+        if (
+          wp.media.view &&
+          wp.media.view.settings &&
+          wp.media.view.settings.post &&
+          wp.media.view.settings.post.featuredImageId
+        ) {
+          pushId(wp.media.view.settings.post.featuredImageId);
+        }
+        if (wp.data && typeof wp.data.select === 'function') {
+          var editor = wp.data.select('core/editor');
+          if (editor && typeof editor.getEditedPostAttribute === 'function') {
+            pushId(editor.getEditedPostAttribute('featured_media'));
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore.
+    }
+
+    var popup = getAcfPopup(frame, frame && frame._mlsAcfPopup);
+    if (popup) {
+      var selected = popup.get('selected');
+      if (selected && selected.length) {
+        pushId(selected[selected.length - 1]);
+      }
+      pushId(popup.get('attachment'));
+    }
+
+    if (lastAcfFieldEl && window.acf && typeof acf.getField === 'function') {
+      try {
+        var field = acf.getField($(lastAcfFieldEl));
+        if (field && typeof field.val === 'function') {
+          var val = field.val();
+          if (Object.prototype.toString.call(val) === '[object Array]') {
+            if (val.length) {
+              pushId(val[val.length - 1]);
+            }
+          } else {
+            pushId(val);
+          }
+        }
+      } catch (e) {
+        // Ignore.
+      }
+    }
+
+    try {
+      if (frame && typeof frame.state === 'function') {
+        var state = frame.state();
+        var selection = state && typeof state.get === 'function' ? state.get('selection') : null;
+        if (selection && typeof selection.single === 'function') {
+          var single = selection.single();
+          if (single && single.id) {
+            pushId(single.id);
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore.
+    }
+
+    return ids;
+  }
+
+  function resolveModalKey(frame, acfPopup) {
+    if (frame && frame._mlsInstanceKey) {
+      pendingModalKind = null;
+      return frame._mlsInstanceKey;
+    }
+
+    var popup = getAcfPopup(frame, acfPopup);
+    if (popup) {
+      if (popup._mlsInstanceKey) {
+        pendingModalKind = null;
+        return popup._mlsInstanceKey;
+      }
+      var field = resolveAcfFieldForPopup(popup);
+      var fieldKey = popup.get('field') || '';
+      pendingModalKind = null;
+      return buildAcfInstanceKey(fieldKey, field);
+    }
+
+    // Prefer explicit featured-image intent from the click that opened media.
+    if (pendingModalKind === 'featured-image' || isFeaturedImageFrame(frame)) {
+      pendingModalKind = null;
       return 'featured-image';
     }
+
+    pendingModalKind = null;
 
     var clientId = getSelectedBlockClientId();
     if (clientId) {
@@ -449,6 +938,19 @@
       queryProps: pickQueryProps(query.props),
       fingerprint: fingerprintQuery(query),
     });
+
+    // Library items are in the DOM now — retry scroll-to-selected if needed.
+    if (pendingFocusAttachmentIds && pendingFocusAttachmentIds.length) {
+      var $root = null;
+      try {
+        if (window.wp && wp.media && wp.media.frame && wp.media.frame.$el) {
+          $root = wp.media.frame.$el;
+        }
+      } catch (e) {
+        // Ignore.
+      }
+      scheduleScrollToAttachment(pendingFocusAttachmentIds, $root);
+    }
   }
 
   function pagesFromLength(query) {
@@ -524,11 +1026,45 @@
 
     proto.more = function (options) {
       var query = this;
+
+      // Gutenberg MediaUpload.updateCollection() wipes visible models, forces
+      // _hasMore, then more(). If the mirrored query is empty, treat like the
+      // initial read so featured-image restore can still inflate.
+      if (
+        persistModals &&
+        activeModalKey &&
+        this.args &&
+        this.length === 0 &&
+        !this._mls
+      ) {
+        var perPage = (this.args && this.args.posts_per_page) || 80;
+        perPage = parseInt(perPage, 10) || 80;
+        var pages = getDesiredPages(this);
+        this._mls = {
+          originalPerPage: perPage,
+          inflatedPages: pages > 1 ? pages : 0,
+        };
+        if (pages > 1 && perPage > 0) {
+          this.args.posts_per_page = perPage * pages;
+        }
+      }
+
       var promise = originalMore.apply(this, arguments);
       if (promise && typeof promise.done === 'function') {
         promise.done(function () {
-          var pages = pagesFromLength(query);
-          persistAfterLoad(query, pages);
+          if (query._mls && query._mls.inflatedPages) {
+            var inflatedPages = query._mls.inflatedPages;
+            var originalPerPage = query._mls.originalPerPage;
+            query._mls.inflatedPages = 0;
+            query.args.posts_per_page = originalPerPage;
+            if (query.length < originalPerPage * inflatedPages) {
+              query._hasMore = false;
+            } else {
+              query._hasMore = true;
+            }
+          }
+          var pagesAfter = pagesFromLength(query);
+          persistAfterLoad(query, pagesAfter);
         });
       }
       return promise;
@@ -545,6 +1081,9 @@
   /**
    * upload.php seeds _wpMediaGridSettings.queryVars from $_GET. Strip our
    * pagination param so it is not treated as an attachment query arg.
+   * Also seed order defaults before the Manage frame boots so filter dropdowns
+   * match without a post-ready props.set (that requery can prevent
+   * Backbone.history from starting, breaking core ?item= navigation).
    */
   function sanitizeGridSettings() {
     if (!window._wpMediaGridSettings || !_wpMediaGridSettings.queryVars) {
@@ -553,6 +1092,12 @@
     var vars = _wpMediaGridSettings.queryVars;
     if (Object.prototype.hasOwnProperty.call(vars, queryVar)) {
       delete vars[queryVar];
+    }
+    if (!vars.order) {
+      vars.order = 'DESC';
+    }
+    if (!vars.orderby) {
+      vars.orderby = 'date';
     }
   }
 
@@ -581,9 +1126,10 @@
   }
 
   /**
-   * Core AttachmentFilters.select() requires order/orderby to match filter
-   * props; PHP-seeded queryVars often omit order, so the dropdown stays on
-   * "All" even when type/date filters are active. Fill defaults + re-sync.
+   * Light post-ready cleanup only. Order defaults are seeded in
+   * sanitizeGridSettings before the frame is created — do not props.set /
+   * trigger('change') here or the library remirrors, AttachmentsBrowser is
+   * recreated, and Manage never starts Backbone.history (?item= breaks).
    */
   function syncManageFilterUi(library) {
     if (!library || !library.props) {
@@ -593,20 +1139,8 @@
     suppressUrlWrite = true;
     try {
       if (library.props.get(queryVar) != null) {
-        library.props.unset(queryVar);
+        library.props.unset(queryVar, { silent: true });
       }
-      var patch = {};
-      if (!library.props.get('order')) {
-        patch.order = 'DESC';
-      }
-      if (!library.props.get('orderby')) {
-        patch.orderby = 'date';
-      }
-      if (Object.keys(patch).length) {
-        library.props.set(patch);
-      }
-      // Re-run AttachmentFilters.select() listeners.
-      library.props.trigger('change');
       restoreSearchInput(library.props.get('search'));
     } finally {
       suppressUrlWrite = false;
@@ -621,11 +1155,59 @@
     managedFilterKeys = Object.keys(readUrlFilters());
     syncManageFilterUi(library);
     manageFingerprint = fingerprintProps(library.props);
+    snapshotManageLocation();
 
     if (typeof library.props.off === 'function') {
       library.props.off('change.mediaLibraryState');
     }
     library.props.on('change.mediaLibraryState', onManagePropsChange);
+  }
+
+  /**
+   * Core closes the item modal via EditAttachments.resetRoute → navigate to
+   * upload.php or upload.php?search= only. Restore the snapshotted manage URL.
+   */
+  function patchEditAttachmentsResetRoute() {
+    if (
+      !isUploadScreen ||
+      !persistUrl ||
+      !window.wp ||
+      !wp.media ||
+      !wp.media.view ||
+      !wp.media.view.MediaFrame ||
+      !wp.media.view.MediaFrame.EditAttachments
+    ) {
+      return false;
+    }
+
+    var proto = wp.media.view.MediaFrame.EditAttachments.prototype;
+    if (proto._mediaLibraryStateResetPatched) {
+      return true;
+    }
+
+    var originalResetRoute = proto.resetRoute;
+    proto.resetRoute = function () {
+      if (lastManageFragment) {
+        try {
+          var router = this.gridRouter;
+          if (router && typeof router.navigate === 'function') {
+            router.navigate(lastManageFragment, { replace: true, trigger: false });
+            return;
+          }
+          var pathAndSearch = fragmentToPathAndSearch(lastManageFragment);
+          if (pathAndSearch && window.history && history.replaceState) {
+            history.replaceState(null, '', pathAndSearch);
+            return;
+          }
+        } catch (e) {
+          // Fall through to core.
+        }
+      }
+      return originalResetRoute.apply(this, arguments);
+    };
+
+    proto._mediaLibraryStateResetPatched = true;
+    return true;
   }
 
   function bindManageGridReady() {
@@ -634,7 +1216,11 @@
     }
     window._mediaLibraryStateGridBound = true;
 
+    snapshotManageLocation();
+    patchEditAttachmentsResetRoute();
+
     $(document).on('wp-media-grid-ready.mediaLibraryState', function (event, frame) {
+      patchEditAttachmentsResetRoute();
       var state = frame && typeof frame.state === 'function' ? frame.state() : null;
       var library = state && typeof state.get === 'function' ? state.get('library') : null;
       if (library) {
@@ -676,21 +1262,149 @@
     }
   }
 
+  function isManageFrame(frame) {
+    try {
+      return !!(
+        frame &&
+        window.wp &&
+        wp.media &&
+        wp.media.view &&
+        wp.media.view.MediaFrame &&
+        wp.media.view.MediaFrame.Manage &&
+        frame instanceof wp.media.view.MediaFrame.Manage
+      );
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * Prepare modal key / bindings before MediaFrame.open attaches content.
+   * Gutenberg featured image uses unstableFeaturedImageFlow, which constructs
+   * `new MediaFrame.Select.extend(...)` and never goes through wp.media() —
+   * so bindModalFrame from the factory never runs on the real frame. Queries
+   * also start during modal.attach(), before the 'open' event, so the key
+   * must be set here or inflation never runs.
+   */
+  function activateModalSession(frame) {
+    if (!persistModals || !frame || isManageFrame(frame)) {
+      return;
+    }
+
+    if (pendingModalKind === 'featured-image' || isFeaturedImageFrame(frame)) {
+      frame._mlsFeaturedImage = true;
+    }
+    if (frame.acf && typeof frame.acf.get === 'function') {
+      frame._mlsAcfPopup = frame.acf;
+    }
+
+    bindModalFrame(frame, frame._mlsAcfPopup || null);
+
+    activeModalKey = resolveModalKey(frame, frame._mlsAcfPopup || null);
+    restoredThisOpen = Object.create(null);
+    frame._mlsSessionKey = activeModalKey;
+
+    var focusIds = getFocusAttachmentIds(frame);
+    pendingFocusAttachmentIds = focusIds.length ? focusIds : null;
+
+    var saved = modalStates.get(activeModalKey);
+    var key = activeModalKey;
+
+    function queueFocusScroll() {
+      if (activeModalKey !== key) {
+        return;
+      }
+      // Re-read ids — featured-image selection is often applied in onOpen
+      // after activateModalSession runs.
+      var latest = getFocusAttachmentIds(frame);
+      if (latest.length) {
+        pendingFocusAttachmentIds = latest;
+      }
+      if (pendingFocusAttachmentIds && pendingFocusAttachmentIds.length) {
+        scheduleScrollToAttachment(pendingFocusAttachmentIds, frame.$el);
+      } else if (saved && typeof saved.scrollTop === 'number' && saved.scrollTop > 0) {
+        scheduleScrollRestore(saved.scrollTop, frame.$el);
+      }
+    }
+
+    window.setTimeout(function () {
+      if (activeModalKey !== key) {
+        return;
+      }
+      if (saved && saved.queryProps && Object.keys(saved.queryProps).length) {
+        applyModalQueryProps(frame, saved.queryProps);
+      }
+      queueFocusScroll();
+    }, 0);
+
+    // Retry after MediaUpload.onOpen / ACF filters settle and after library paints.
+    window.setTimeout(queueFocusScroll, 400);
+    window.setTimeout(queueFocusScroll, 1000);
+
+    // When attachments are added to the library (inflated fetch / more), scroll again.
+    try {
+      var state = typeof frame.state === 'function' ? frame.state() : null;
+      var library = state && typeof state.get === 'function' ? state.get('library') : null;
+      if (library && typeof library.on === 'function' && !frame._mlsFocusLibraryBound) {
+        frame._mlsFocusLibraryBound = true;
+        var onLibraryChange = function () {
+          if (pendingFocusAttachmentIds && pendingFocusAttachmentIds.length) {
+            scheduleScrollToAttachment(pendingFocusAttachmentIds, frame.$el);
+          }
+        };
+        library.on('add reset', onLibraryChange);
+        frame.on('close', function () {
+          library.off('add reset', onLibraryChange);
+          frame._mlsFocusLibraryBound = false;
+        });
+      }
+    } catch (e) {
+      // Ignore.
+    }
+  }
+
+  function patchMediaFrameOpen() {
+    if (
+      !window.wp ||
+      !wp.media ||
+      !wp.media.view ||
+      !wp.media.view.MediaFrame ||
+      wp.media.view.MediaFrame.prototype._mediaLibraryStateOpenPatched
+    ) {
+      return !!(window.wp && wp.media && wp.media.view && wp.media.view.MediaFrame);
+    }
+
+    var proto = wp.media.view.MediaFrame.prototype;
+    var originalOpen = proto.open;
+
+    proto.open = function () {
+      activateModalSession(this);
+      return originalOpen.apply(this, arguments);
+    };
+
+    proto._mediaLibraryStateOpenPatched = true;
+    return true;
+  }
+
   function bindModalFrame(frame, acfPopup) {
-    if (!frame || frame._mediaLibraryStateBound || typeof frame.on !== 'function') {
+    if (!frame || typeof frame.on !== 'function') {
       return;
     }
 
     // upload.php Manage grid is not a picker modal — binding it would set
     // activeModalKey permanently and block media_pages / filter URL writes.
-    if (
-      window.wp &&
-      wp.media &&
-      wp.media.view &&
-      wp.media.view.MediaFrame &&
-      wp.media.view.MediaFrame.Manage &&
-      frame instanceof wp.media.view.MediaFrame.Manage
-    ) {
+    if (isManageFrame(frame)) {
+      return;
+    }
+
+    // ACF calls wp.media() before new_media_popup — always keep the latest popup.
+    if (acfPopup) {
+      frame._mlsAcfPopup = acfPopup;
+    } else if (frame.acf && typeof frame.acf.get === 'function') {
+      frame._mlsAcfPopup = frame.acf;
+    }
+
+    if (frame._mediaLibraryStateBound) {
       return;
     }
 
@@ -701,25 +1415,29 @@
         return;
       }
 
-      activeModalKey = resolveModalKey(frame, acfPopup || null);
-      restoredThisOpen = Object.create(null);
-
-      var saved = modalStates.get(activeModalKey);
-      if (saved && saved.queryProps && Object.keys(saved.queryProps).length) {
-        // Re-apply filters before the browse query so fingerprint matches.
-        window.setTimeout(function () {
-          applyModalQueryProps(frame, saved.queryProps);
-        }, 0);
+      // Re-read ACF popup at open time when session was not pre-activated
+      // (e.g. rare paths that skip MediaFrame.open).
+      if (frame.acf && typeof frame.acf.get === 'function') {
+        frame._mlsAcfPopup = frame.acf;
       }
 
-      if (saved && typeof saved.scrollTop === 'number' && saved.scrollTop > 0) {
-        scheduleScrollRestore(saved.scrollTop, frame.$el);
+      // activateModalSession already set the key before attach/query — do not
+      // clear restoredThisOpen or we wipe the inflation flag mid-request.
+      if (frame._mlsSessionKey && activeModalKey === frame._mlsSessionKey) {
+        return;
       }
+
+      activateModalSession(frame);
     });
 
     frame.on('close', function () {
       if (!persistModals || !activeModalKey) {
         activeModalKey = null;
+        pendingModalKind = null;
+        pendingFocusAttachmentIds = null;
+        if (frame) {
+          frame._mlsSessionKey = null;
+        }
         return;
       }
 
@@ -738,6 +1456,9 @@
       });
 
       activeModalKey = null;
+      pendingModalKind = null;
+      pendingFocusAttachmentIds = null;
+      frame._mlsSessionKey = null;
     });
   }
 
@@ -758,6 +1479,42 @@
     wp.media._mediaLibraryStatePatched = true;
 
     ensureQueryPatch();
+    patchFeaturedImageFrame();
+    return true;
+  }
+
+  /**
+   * Classic #set-post-thumbnail uses wp.media.featuredImage.frame(). Tag it so
+   * resolveModalKey does not fall through to block:/select.
+   */
+  function patchFeaturedImageFrame() {
+    if (!window.wp || !wp.media || !wp.media.featuredImage) {
+      return false;
+    }
+    if (wp.media.featuredImage._mediaLibraryStatePatched) {
+      return true;
+    }
+
+    var originalFrame = wp.media.featuredImage.frame;
+    if (typeof originalFrame !== 'function') {
+      return false;
+    }
+
+    wp.media.featuredImage.frame = function () {
+      var frame = originalFrame.apply(this, arguments);
+      if (frame) {
+        frame._mlsFeaturedImage = true;
+        bindModalFrame(frame, null);
+      }
+      return frame;
+    };
+
+    if (wp.media.featuredImage._frame) {
+      wp.media.featuredImage._frame._mlsFeaturedImage = true;
+      bindModalFrame(wp.media.featuredImage._frame, null);
+    }
+
+    wp.media.featuredImage._mediaLibraryStatePatched = true;
     return true;
   }
 
@@ -770,22 +1527,82 @@
     }
     window._mediaLibraryStateAcfBound = true;
 
+    var acfFieldSelector =
+      '.acf-field[data-type="image"], .acf-field[data-type="gallery"], .acf-field[data-type="file"]';
+
+    function captureAcfFieldEl(el) {
+      if (!el) {
+        return;
+      }
+      var fieldEl =
+        el.closest && el.closest('.acf-field[data-type="image"], .acf-field[data-type="gallery"], .acf-field[data-type="file"]');
+      lastAcfFieldEl = fieldEl || el;
+      pendingModalKind = 'acf';
+    }
+
+    // Capture the specific field instance before ACF opens its media popup.
     $(document).on(
-      'mousedown.mediaLibraryState',
-      '.acf-field[data-type="image"], .acf-field[data-type="gallery"], .acf-field[data-type="file"]',
+      'mousedown.mediaLibraryState click.mediaLibraryState',
+      acfFieldSelector,
       function () {
-        lastAcfFieldEl = this;
+        captureAcfFieldEl(this);
+      }
+    );
+
+    // Gallery's "Add to gallery" control — bind explicitly (pro field events).
+    $(document).on(
+      'mousedown.mediaLibraryState click.mediaLibraryState',
+      '.acf-gallery-add, .acf-field-gallery .acf-button',
+      function (event) {
+        captureAcfFieldEl(event.target);
       }
     );
 
     acf.addAction('new_media_popup', function (popup) {
       ensureQueryPatch();
-      if (popup && popup.frame) {
+      if (!popup) {
+        return;
+      }
+
+      var field = resolveAcfFieldForPopup(popup);
+      var fieldKey = typeof popup.get === 'function' ? popup.get('field') || '' : '';
+      var instanceKey = buildAcfInstanceKey(fieldKey, field);
+      popup._mlsInstanceKey = instanceKey;
+
+      if (popup.frame) {
+        // Must run after wp.media() bind so we attach the ACF popup reference
+        // (bindModalFrame is otherwise a no-op once _mediaLibraryStateBound).
+        popup.frame._mlsInstanceKey = instanceKey;
+        popup.frame._mlsAcfPopup = popup;
         bindModalFrame(popup.frame, popup);
       }
     });
 
     return true;
+  }
+
+  function bindFeaturedImageOpeners() {
+    if (window._mediaLibraryStateFeaturedBound) {
+      return;
+    }
+    window._mediaLibraryStateFeaturedBound = true;
+
+    // Classic meta box + block editor featured image controls.
+    $(document).on(
+      'mousedown.mediaLibraryState click.mediaLibraryState',
+      [
+        '#set-post-thumbnail',
+        '#postimagediv .inside img',
+        '.editor-post-featured-image__toggle',
+        '.editor-post-featured-image__preview',
+        '.editor-post-featured-image__container button',
+        '.editor-post-featured-image button',
+        '.editor-post-featured-image__media-modal',
+      ].join(', '),
+      function () {
+        pendingModalKind = 'featured-image';
+      }
+    );
   }
 
   /* ------------------------------------------------------------------ */
@@ -797,8 +1614,13 @@
     sanitizeGridSettings();
     ensureQueryPatch();
     bindManageGridReady();
+    patchEditAttachmentsResetRoute();
     patchMediaFactory();
+    patchFeaturedImageFrame();
+    patchMediaFrameOpen();
     bindAcfPopups();
+    bindFeaturedImageOpeners();
+    snapshotManageLocation();
 
     // Reload with media_pages already set — scroll once attachments inflate.
     if (isUploadScreen && readUrlPages() > 1) {
@@ -813,7 +1635,10 @@
   } else {
     bindManageGridReady();
     patchMediaFactory();
+    patchFeaturedImageFrame();
+    patchMediaFrameOpen();
     bindAcfPopups();
+    bindFeaturedImageOpeners();
   }
 
   $(function () {
