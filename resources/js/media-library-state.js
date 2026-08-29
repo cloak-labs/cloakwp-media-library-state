@@ -121,7 +121,9 @@
         key === 'order' ||
         key === 'orderby' ||
         key === 'queryOrderbyCache' ||
-        key === 'menuOrder'
+        key === 'menuOrder' ||
+        key === 'query' ||
+        key === queryVar
       ) {
         return;
       }
@@ -246,16 +248,33 @@
     if (!pendingScroll) {
       return;
     }
+
+    // upload.php grid scrolls the window; modal browsers scroll .attachments.
+    if (pendingScroll.mode === 'bottom' && isUploadScreen && !pendingScroll.$root) {
+      var doc = document.documentElement;
+      var body = document.body;
+      var height = Math.max(doc ? doc.scrollHeight : 0, body ? body.scrollHeight : 0);
+      window.scrollTo(0, height);
+      pendingScroll.attempts = (pendingScroll.attempts || 0) + 1;
+      if (
+        height > (window.innerHeight || 0) + 40 ||
+        pendingScroll.attempts >= 4
+      ) {
+        pendingScroll = null;
+      }
+      return;
+    }
+
     var $el = getAttachmentsScroller(pendingScroll.$root);
     if (!$el.length) {
       return;
     }
 
     if (pendingScroll.mode === 'bottom') {
-      var height = $el.prop('scrollHeight') || 0;
-      $el.scrollTop(height);
+      var elHeight = $el.prop('scrollHeight') || 0;
+      $el.scrollTop(elHeight);
       pendingScroll.attempts = (pendingScroll.attempts || 0) + 1;
-      if (height > ($el.innerHeight() || 0) + 40 || pendingScroll.attempts >= 4) {
+      if (elHeight > ($el.innerHeight() || 0) + 40 || pendingScroll.attempts >= 4) {
         pendingScroll = null;
       }
       return;
@@ -435,6 +454,10 @@
     var originalMore = proto.more;
 
     proto.sync = function (method, model, options) {
+      if (this.args && Object.prototype.hasOwnProperty.call(this.args, queryVar)) {
+        delete this.args[queryVar];
+      }
+
       if (method === 'read' && this.length === 0 && !this._mls) {
         var perPage = (this.args && this.args.posts_per_page) || 80;
         perPage = parseInt(perPage, 10) || 80;
@@ -490,8 +513,22 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Manage screen: restore filters from URL before first query         */
+  /* Manage screen: URL filters via PHP queryVars + live URL writes     */
   /* ------------------------------------------------------------------ */
+
+  /**
+   * upload.php seeds _wpMediaGridSettings.queryVars from $_GET. Strip our
+   * pagination param so it is not treated as an attachment query arg.
+   */
+  function sanitizeGridSettings() {
+    if (!window._wpMediaGridSettings || !_wpMediaGridSettings.queryVars) {
+      return;
+    }
+    var vars = _wpMediaGridSettings.queryVars;
+    if (Object.prototype.hasOwnProperty.call(vars, queryVar)) {
+      delete vars[queryVar];
+    }
+  }
 
   function restoreSearchInput(search) {
     if (!search) {
@@ -517,79 +554,78 @@
     }
   }
 
-  function applyManageFiltersFromUrl(library) {
-    if (!library || !library.props || typeof library.props.set !== 'function') {
+  /**
+   * Core AttachmentFilters.select() requires order/orderby to match filter
+   * props; PHP-seeded queryVars often omit order, so the dropdown stays on
+   * "All" even when type/date filters are active. Fill defaults + re-sync.
+   */
+  function syncManageFilterUi(library) {
+    if (!library || !library.props) {
       return;
     }
 
-    var filters = readUrlFilters();
-    managedFilterKeys = Object.keys(filters);
+    suppressUrlWrite = true;
+    if (library.props.get(queryVar) != null) {
+      library.props.unset(queryVar);
+    }
+    var patch = {};
+    if (!library.props.get('order')) {
+      patch.order = 'DESC';
+    }
+    if (!library.props.get('orderby')) {
+      patch.orderby = 'date';
+    }
+    if (Object.keys(patch).length) {
+      library.props.set(patch);
+    }
+    // Re-run AttachmentFilters.select() listeners.
+    library.props.trigger('change');
+    suppressUrlWrite = false;
 
-    if (Object.keys(filters).length) {
-      suppressUrlWrite = true;
-      library.props.set(filters);
-      suppressUrlWrite = false;
+    restoreSearchInput(library.props.get('search'));
+  }
+
+  function bindManageLibrary(library) {
+    if (!library || !library.props) {
+      return;
     }
 
+    managedFilterKeys = Object.keys(readUrlFilters());
+    syncManageFilterUi(library);
     manageFingerprint = fingerprintProps(library.props);
 
     if (typeof library.props.off === 'function') {
       library.props.off('change.mediaLibraryState');
     }
     library.props.on('change.mediaLibraryState', onManagePropsChange);
-
-    if (filters.search) {
-      window.setTimeout(function () {
-        restoreSearchInput(filters.search);
-      }, 0);
-    }
   }
 
-  function patchManageFrame() {
-    if (!isUploadScreen || !persistUrl) {
-      return false;
+  function bindManageGridReady() {
+    if (!isUploadScreen || !persistUrl || window._mediaLibraryStateGridBound) {
+      return;
     }
-    if (!window.wp || !wp.media || !wp.media.view || !wp.media.view.MediaFrame) {
-      return false;
-    }
-    var Manage = wp.media.view.MediaFrame.Manage;
-    if (!Manage || !Manage.prototype) {
-      return false;
-    }
-    if (Manage.prototype._mediaLibraryStatePatched) {
-      return true;
-    }
+    window._mediaLibraryStateGridBound = true;
 
-    var originalInitialize = Manage.prototype.initialize;
-    Manage.prototype.initialize = function () {
-      originalInitialize.apply(this, arguments);
-
-      var state = typeof this.state === 'function' ? this.state() : null;
+    $(document).on('wp-media-grid-ready.mediaLibraryState', function (event, frame) {
+      var state = frame && typeof frame.state === 'function' ? frame.state() : null;
       var library = state && typeof state.get === 'function' ? state.get('library') : null;
       if (library) {
-        applyManageFiltersFromUrl(library);
+        bindManageLibrary(library);
       }
+      if (readUrlPages() > 1) {
+        scheduleScrollToBottom(null);
+      }
+    });
 
-      this.on('content:activate:browse', function () {
-        var browser = null;
-        try {
-          browser = this.content.get();
-        } catch (e) {
-          return;
-        }
-        if (!browser || !browser.collection) {
-          return;
-        }
-        if (manageFingerprint === null) {
-          applyManageFiltersFromUrl(browser.collection);
-        }
-        var search = browser.collection.props && browser.collection.props.get('search');
-        restoreSearchInput(search);
-      });
-    };
-
-    Manage.prototype._mediaLibraryStatePatched = true;
-    return true;
+    // Frame may already exist if media.js ran first.
+    if (window.wp && wp.media && wp.media.frames && wp.media.frames.browse) {
+      var existing = wp.media.frames.browse;
+      var state = typeof existing.state === 'function' ? existing.state() : null;
+      var library = state && typeof state.get === 'function' ? state.get('library') : null;
+      if (library) {
+        bindManageLibrary(library);
+      }
+    }
   }
 
   /* ------------------------------------------------------------------ */
@@ -716,8 +752,9 @@
 
   function boot() {
     managedFilterKeys = Object.keys(readUrlFilters());
+    sanitizeGridSettings();
     ensureQueryPatch();
-    patchManageFrame();
+    bindManageGridReady();
     patchMediaFactory();
     bindAcfPopups();
 
@@ -727,10 +764,12 @@
     }
   }
 
+  sanitizeGridSettings();
+
   if (!ensureQueryPatch()) {
     $(boot);
   } else {
-    patchManageFrame();
+    bindManageGridReady();
     patchMediaFactory();
     bindAcfPopups();
   }
