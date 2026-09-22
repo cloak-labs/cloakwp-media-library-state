@@ -35,6 +35,18 @@
   };
   RESERVED_URL_PARAMS[queryVar] = true;
 
+  /**
+   * Frame-owned constraints are not user filters and must never leak into a
+   * persisted picker snapshot. ACF's attachment edit popup, for example, uses
+   * post__in: [attachmentId] so only the attachment being edited is visible.
+   */
+  var FRAME_CONSTRAINT_PROPS = {
+    post__in: true,
+    post__not_in: true,
+    include: true,
+    exclude: true,
+  };
+
   /** @type {Map<string, {pages:number, scrollTop:number, queryProps:Object, fingerprint:string}>} */
   var modalStates = new Map();
 
@@ -125,22 +137,41 @@
     return value;
   }
 
+  function propsToObject(props) {
+    if (!props) {
+      return {};
+    }
+    return typeof props.toJSON === 'function'
+      ? props.toJSON()
+      : typeof props === 'object'
+        ? props
+        : {};
+  }
+
+  /**
+   * Positive attachment constraints identify a frame whose library is only a
+   * temporary subset, such as ACF's one-attachment edit popup.
+   */
+  function hasRestrictedAttachmentSet(props) {
+    var source = propsToObject(props);
+    return ['post__in', 'include'].some(function (key) {
+      var value = source[key];
+      if (Object.prototype.toString.call(value) === '[object Array]') {
+        return value.length > 0;
+      }
+      return value !== null && value !== undefined && value !== '' && value !== false;
+    });
+  }
+
   /**
    * Props that define the attachment listing (exclude refresh / sort noise).
    */
   function pickQueryProps(props) {
     var out = {};
-    if (!props) {
-      return out;
-    }
-    var source =
-      typeof props.toJSON === 'function'
-        ? props.toJSON()
-        : typeof props === 'object'
-          ? props
-          : {};
+    var source = propsToObject(props);
     Object.keys(source).forEach(function (key) {
       if (
+        FRAME_CONSTRAINT_PROPS[key] ||
         key === 'ignore' ||
         key === 'order' ||
         key === 'orderby' ||
@@ -874,6 +905,15 @@
   /* ------------------------------------------------------------------ */
 
   function getDesiredPages(query) {
+    if (
+      hasRestrictedAttachmentSet(query && query.props) ||
+      hasRestrictedAttachmentSet(query && query.args)
+    ) {
+      // Do not consume or mutate the normal picker state while ACF is showing
+      // its attachment-only edit popup.
+      return 1;
+    }
+
     var fingerprint = fingerprintQuery(query);
 
     if (isManageContext()) {
@@ -956,6 +996,13 @@
 
   function persistAfterLoad(query, pages) {
     pages = clampPages(pages);
+
+    if (
+      hasRestrictedAttachmentSet(query && query.props) ||
+      hasRestrictedAttachmentSet(query && query.args)
+    ) {
+      return;
+    }
 
     if (queryIsStale(query)) {
       return;
@@ -1298,6 +1345,9 @@
       var state = frame.state();
       var library = state && typeof state.get === 'function' ? state.get('library') : null;
       if (!library || !library.props || typeof library.props.set !== 'function') {
+        return;
+      }
+      if (hasRestrictedAttachmentSet(library.props)) {
         return;
       }
       library.props.set(queryProps);
