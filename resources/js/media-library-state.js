@@ -2,7 +2,7 @@
  * Media Library State — persist Load more depth + upload.php filters.
  *
  * - upload.php grid: media_pages + filter props in the URL via history.replaceState;
- *   when media_pages > 1 after reload, scroll to the bottom of the grid
+ *   with the Load more button, scroll to the bottom after restoring depth
  * - Media modals (Gutenberg / ACF / featured image): per-instance in-memory pages + scroll + filters
  *
  * Restore strategy: inflate the first query-attachments request to posts_per_page * N,
@@ -426,6 +426,20 @@
   }
 
   function scheduleScrollToBottom($root) {
+    // Infinite scrolling loads the next page when the viewport reaches the
+    // bottom. Moving it there after each load would trigger another load and
+    // keep pulling the user down until the entire library has been fetched.
+    if (
+      isUploadScreen &&
+      !$root &&
+      window.wp &&
+      wp.media &&
+      wp.media.view &&
+      wp.media.view.settings &&
+      wp.media.view.settings.infiniteScrolling
+    ) {
+      return;
+    }
     pendingScroll = { mode: 'bottom', $root: $root || null, attempts: 0 };
     window.setTimeout(applyPendingScroll, 50);
     window.setTimeout(applyPendingScroll, 250);

@@ -10,10 +10,10 @@ Configured in PHP. No settings UI, no admin notices, no premium upsells.
 
 ### Media Library grid (`upload.php`)
 
-- Each **Load more** writes `?media_pages=N` into the current tab URL via `history.replaceState` (no Back-button spam).
+- Loading more attachments writes `?media_pages=N` into the current tab URL via `history.replaceState` (no Back-button spam). This works with both infinite scrolling and the **Load more** button.
 - Active filters (type, date, search, and custom filters created via `cloakwp/core` package's `LibraryFilters`) are kept in the same URL alongside `media_pages`.
 - Reloading the tab — or opening the URL elsewhere — restores filters and fetches the previously loaded depth in one request, then **Load more** continues from there.
-- When `media_pages > 1` after a reload, the page scrolls to the bottom (where Load more lives).
+- With the **Load more** button, the grid scrolls to the bottom after restoring multiple pages. With infinite scrolling, it does not force the page to the bottom: doing so would immediately trigger another load.
 - Clicking an item (opening the attachment modal) still appends `?item={id}` to the URL (core behaviour); closing that modal restores your prior grid URL params (filters + `media_pages`), instead of core’s bare `upload.php` / `?search=` reset.
 
 ### Media modals (block editor, ACF, featured image)
@@ -135,6 +135,7 @@ resources/js/          # Query inflate + URL / modal persistence
 ```bash
 composer install
 composer test
+node --test tests/media-grid-scroll.test.cjs
 ```
 
 ## License
